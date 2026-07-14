@@ -1,0 +1,309 @@
+---
+title: "Sample Tidy"
+format:
+  html:
+    code-fold: true
+    code-summary: "Show code"
+    code-tools: true
+date: 2026-07-14
+---
+
+```{r setup, message=FALSE}
+library(tidyverse)
+library(readxl)
+library(lubridate)
+
+if (!dir.exists("out")) {
+  dir.create("out")
+}
+
+output_dir <- "out/20260714"
+
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir)
+}
+```
+
+## Pull real pepseq sample names
+
+`data_for_sharing_20250214` is the canonical Berry R21 share-out (see project notes on
+why this supersedes the undated `data_for_sharing/`). We read just the header row of
+each matrix (`n_max = 0`) rather than the full ~60MB file, since only the sample names
+are needed here.
+
+```{r}
+igg_path <- "../pepsirf_data/data_for_sharing_20250214/IM0166_IM0174_PF1_raw_4mm_IgG_qc_Z-HDI85.tsv"
+iga_path <- "../pepsirf_data/data_for_sharing_20250214/IM0166_PF1_raw_4mm_IgA_qc_Z-HDI85.tsv"
+
+igg_samples <- colnames(read_tsv(igg_path, n_max = 0, show_col_types = FALSE))
+iga_samples <- colnames(read_tsv(iga_path, n_max = 0, show_col_types = FALSE))
+
+pepseq_sn <- tibble(pepseq_sn = c(igg_samples, iga_samples)) %>%
+  filter(pepseq_sn != "Sequence name") %>%
+  filter(str_detect(pepseq_sn, "Sblk", negate = TRUE)) %>%
+  distinct() %>%
+  mutate(isotype = case_when(
+    str_detect(pepseq_sn, "_IgA_") ~ "IgA",
+    str_detect(pepseq_sn, "_ProG_") ~ "IgG",
+    TRUE ~ NA_character_
+  )) %>%
+  mutate(subject_id = str_split_fixed(pepseq_sn, "_", 3)[, 1]) %>%
+  mutate(timepoint_or_date = str_split_fixed(pepseq_sn, "_", 3)[, 2]) %>%
+  # ICS-format subject IDs are Mfera; plain numeric IDs are Liwonde
+  # (same convention as the original 0-sample_tidy_v2.R)
+  mutate(cohort = case_when(
+    str_detect(subject_id, "ICS") ~ "Mfera",
+    TRUE ~ "Liwonde"
+  )) %>%
+  # Some draws were sequenced on more than one pepsirf run (e.g. subject 179's
+  # 16-Mar-18 IgG draw exists under both IM0174 and IM0163) -- keep the run ID
+  # so downstream joins/pivots don't silently collapse genuinely distinct
+  # samples that share the same (subject_id, timepoint_or_date, isotype).
+  mutate(run_id = str_extract(pepseq_sn, "IM\\d{4}"))
+
+print(paste0("Total samples: ", nrow(pepseq_sn), " (IgG: ", sum(pepseq_sn$isotype == "IgG"),
+             ", IgA: ", sum(pepseq_sn$isotype == "IgA"), ")"))
+print(paste0("Mfera: ", sum(pepseq_sn$cohort == "Mfera"),
+             ", Liwonde: ", sum(pepseq_sn$cohort == "Liwonde")))
+```
+
+## Mfera cohort
+
+The manifest's "Mfera" sheet gives the exact `(ICS subject_id, Infant Month code)` pair
+per real tube, which matches the second token of the real pepseq sample names directly
+-- no reconstruction needed. `mfera_share_20aug2024.csv` only has a plain integer
+`mfera_id`; the 6-digit segment embedded in the ICS code (`ICS-000020-2` -> `000020`)
+*is* that integer, confirmed against the CSV during planning.
+
+`mfera_share_20aug2024.csv` has one row per infection *episode* (like Liwonde), each
+naming its serum1/serum2 draws via `serum1e`/`serum2e` tube codes (e.g. `020-M18` =
+mfera_id `020` + Infant Month code `M18`). Joining the manifest to this CSV on
+`mfera_id` alone fans out (a subject with 2+ episodes has 2+ clinical rows, but the
+manifest only has one row per tube) -- so, same fix as Liwonde: pivot the clinical data
+long per draw and join on `(mfera_id, timepoint_or_date)` for a precise 1:1 match.
+
+```{r}
+manifest_mfera <- read_excel(
+  "../sample_data/Shared sample information/Liwonder_Mfera_Infant Cohort_Sample Manifest_corrected20240906.xlsx",
+  sheet = "Mfera",
+  skip = 2
+) %>%
+  rename(subject_id = IDs, timepoint_or_date = `Infant Month`) %>%
+  mutate(mfera_id = as.integer(str_extract(subject_id, "(?<=ICS-)\\d{6}")))
+
+meta_mfera <- read_csv("../sample_data/Shared sample information/mfera_share_20aug2024.csv",
+                        show_col_types = FALSE) %>%
+  mutate(mfera_id = as.integer(mfera_id)) %>%
+  # "infection" holds a sample/tube code here (e.g. "027-M21"), unlike Liwonde's
+  # "infection" column which holds an actual date -- rename to avoid conflating
+  # the two when cohorts are combined later.
+  rename(infection_sample_code = infection)
+
+meta_mfera_long <- meta_mfera %>%
+  mutate(record_id = row_number()) %>%
+  pivot_longer(cols = c(serum1e, serum2e), names_to = "serum_which", values_to = "tube_code") %>%
+  mutate(timepoint_or_date = str_sub(tube_code, start = 5))  # strip "020-" prefix
+
+dup_mfera_codes <- meta_mfera_long %>%
+  count(mfera_id, timepoint_or_date) %>%
+  filter(n > 1)
+
+if (nrow(dup_mfera_codes) > 0) {
+  print("Duplicate (mfera_id, timepoint_or_date) pairs in Mfera clinical data -- excluded from the join below, written out for manual review:")
+  print(dup_mfera_codes)
+}
+
+# Exclude ambiguous records from the join itself (rather than let them fan
+# out silently) -- same spirit as Erin's manual drop of subjects 159/63 in
+# the original script, but data-driven so it re-detects whichever subjects
+# are affected as the underlying data changes.
+meta_mfera_long_clean <- meta_mfera_long %>%
+  anti_join(dup_mfera_codes, by = c("mfera_id", "timepoint_or_date"))
+
+manifest_mfera_clinical <- manifest_mfera %>%
+  left_join(meta_mfera_long_clean, by = c("mfera_id", "timepoint_or_date"))
+
+mfera_pepseq <- pepseq_sn %>% filter(cohort == "Mfera")
+
+mfera_tidy <- mfera_pepseq %>%
+  left_join(manifest_mfera_clinical, by = c("subject_id", "timepoint_or_date"))
+
+# QC: manifest entries with no matching real pepseq sample (expected data gaps)
+mfera_missing_pepseq <- manifest_mfera_clinical %>%
+  select(subject_id, timepoint_or_date, mfera_id) %>%
+  anti_join(mfera_pepseq, by = c("subject_id", "timepoint_or_date"))
+
+# QC: real pepseq samples with no manifest entry at all (unexpected)
+mfera_missing_manifest <- mfera_pepseq %>%
+  distinct(subject_id, timepoint_or_date) %>%
+  anti_join(manifest_mfera, by = c("subject_id", "timepoint_or_date"))
+
+print(paste0("Mfera: ", nrow(mfera_missing_pepseq), " manifest entries missing PepSeq data, ",
+             nrow(mfera_missing_manifest), " PepSeq samples missing from manifest"))
+```
+
+## Liwonde cohort
+
+Real sample names encode the collection date directly (e.g. `179_16-Mar-18` or
+`508_16-Nov-2018` -- note the inconsistent 2- vs 4-digit year, which is exactly what
+broke the original string-reconstruction approach in `0-sample_tidy_v2.R`). Instead of
+rebuilding a name to match, we parse the *real* dates and match them against clinical
+`serum1`/`serum2` dates -- comparing real data to real data.
+
+```{r}
+liwonde_pepseq <- pepseq_sn %>%
+  filter(cohort == "Liwonde") %>%
+  mutate(parsed_date = parse_date_time(timepoint_or_date, orders = c("d-b-y", "d-b-Y")) %>% as_date())
+
+meta_liwonde <- read_csv("../sample_data/Shared sample information/liwonde_share_20Aug2024.csv",
+                          show_col_types = FALSE) %>%
+  mutate(subject_id = as.character(liwonde_id)) %>%
+  # Liwonde's "infection" column holds an actual date, unlike Mfera's
+  # "infection_sample_code" (a tube code) -- rename so bind_rows() later
+  # doesn't try to combine two columns with the same name but different
+  # meaning/type.
+  rename(infection_date = infection)
+
+# Pivot serum1/serum2 into long format so every clinical column travels with
+# whichever draw it belongs to; join real samples on (subject_id, parsed_date).
+meta_liwonde_long <- meta_liwonde %>%
+  mutate(record_id = row_number()) %>%
+  pivot_longer(cols = c(serum1, serum2), names_to = "serum_which", values_to = "parsed_date") %>%
+  mutate(parsed_date = as_date(parsed_date))
+
+# Data-driven check for the kind of duplicate-date collision Erin hit before
+# (originally handled by manually dropping rows for subjects 159 and 63).
+# Re-run this each time in case the affected subjects change with new data.
+dup_liwonde_dates <- meta_liwonde_long %>%
+  count(subject_id, parsed_date) %>%
+  filter(n > 1)
+
+if (nrow(dup_liwonde_dates) > 0) {
+  print("Duplicate (subject_id, date) pairs in Liwonde clinical data -- excluded from the join below, written out for manual review:")
+  print(dup_liwonde_dates)
+}
+
+# Same approach as Mfera above: exclude ambiguous records from the join so
+# it stays 1:1, instead of silently fanning out.
+meta_liwonde_long_clean <- meta_liwonde_long %>%
+  anti_join(dup_liwonde_dates, by = c("subject_id", "parsed_date"))
+
+liwonde_tidy <- liwonde_pepseq %>%
+  left_join(meta_liwonde_long_clean, by = c("subject_id", "parsed_date"))
+
+# QC: clinical records with no matching real pepseq sample
+liwonde_missing_pepseq <- meta_liwonde_long %>%
+  select(subject_id, parsed_date, record_id, serum_which) %>%
+  anti_join(liwonde_pepseq, by = c("subject_id", "parsed_date"))
+
+# QC: real pepseq samples with no matching clinical record
+liwonde_missing_clinical <- liwonde_pepseq %>%
+  distinct(subject_id, parsed_date) %>%
+  anti_join(meta_liwonde_long, by = c("subject_id", "parsed_date"))
+
+print(paste0("Liwonde: ", nrow(liwonde_missing_pepseq), " clinical records missing PepSeq data, ",
+             nrow(liwonde_missing_clinical), " PepSeq samples missing from clinical data"))
+```
+
+## Combine cohorts + plate assignment
+
+`PF1_plate_well_sequencingrun.xlsx` (from Alexis, filling the gap in her IgA
+batch-effect analysis) has `SampleName` values that match our real pepseq sample names
+exactly, so this is a plain string join -- no reconstruction. This *preserves* plate
+assignment in the tidy output; it does not correct the batch effect itself (Alexis
+found raw IgA counts from run IM0163 cluster almost perfectly by Plate 2 vs Plate 4,
+persisting even in Z-scores -- that correction, e.g. via ComBat, is a downstream
+analysis decision, out of scope here).
+
+That file's IM0163 coverage turned out to be a partial export (only ~half of Mfera
+subjects). `IM0163_plate_info.xlsx` is the full wet-lab tracking workbook for that run;
+its `NEW ZZSHEET-PF1` tab gives complete IM0163 coverage but in a 4-plates-side-by-side
+print layout rather than a flat list -- 4 repeated column blocks of
+`Index1 | Index2 | SampleName | [blank] | plate | well`, starting at columns 1, 8, 15,
+22. Reassemble by reading blocks separately and stacking them.
+
+Not fully resolved: this tab's plate numbers (1-12, spanning both isotypes per plate)
+don't obviously correspond to the workbook's separate "Plate 1"-"Plate 7" tab names
+elsewhere in the same file -- worth a sanity check with whoever maintains this workbook
+before treating the numbering as more than "which physical batch".
+
+```{r}
+plate_map_im0174 <- read_excel("../sample_data/Shared sample information/PF1_plate_well_sequencingrun.xlsx") %>%
+  rename(pepseq_sn = SampleName) %>%
+  select(pepseq_sn, plate_id, well) %>%
+  mutate(plate_id = as.character(plate_id))
+
+zzsheet_pf1_raw <- suppressMessages(read_excel(
+  "../sample_data/Shared sample information/IM0163_plate_info.xlsx",
+  sheet = "NEW ZZSHEET-PF1", col_names = FALSE, skip = 2
+))
+
+extract_plate_block <- function(df, start_col) {
+  df %>%
+    select(all_of(start_col:(start_col + 5))) %>%
+    set_names(c("Index1", "Index2", "pepseq_sn", "blank_sep", "plate_id", "well")) %>%
+    select(-blank_sep) %>%
+    filter(!is.na(pepseq_sn))
+}
+
+plate_map_im0163 <- bind_rows(
+  extract_plate_block(zzsheet_pf1_raw, 1),
+  extract_plate_block(zzsheet_pf1_raw, 8),
+  extract_plate_block(zzsheet_pf1_raw, 15),
+  extract_plate_block(zzsheet_pf1_raw, 22)
+) %>%
+  select(pepseq_sn, plate_id, well) %>%
+  # normalize "1.0" -> "Plate 1" to match PF1_plate_well_sequencingrun.xlsx's format
+  mutate(plate_id = paste0("Plate ", as.integer(as.numeric(plate_id))))
+
+plate_map <- bind_rows(plate_map_im0163, plate_map_im0174) %>%
+  distinct(pepseq_sn, .keep_all = TRUE)
+
+sample_tidy_all <- bind_rows(mfera_tidy, liwonde_tidy) %>%
+  left_join(plate_map, by = "pepseq_sn")
+
+print(paste0(sum(!is.na(sample_tidy_all$plate_id)), " of ", nrow(sample_tidy_all),
+             " samples matched to a plate assignment"))
+```
+
+## Pairs
+
+Berry R21's design pairs a pre/post sample per infection episode (`serum1`/`serum2`),
+unlike msp1's sequential multi-timepoint design -- so pairs come directly from the
+clinical join rather than a generic timepoint-sequence helper.
+
+Both cohorts now share the same `record_id`/`serum_which`/`pepseq_sn` shape after
+tidying (Mfera's `serum_which` values are `serum1e`/`serum2e`, Liwonde's are
+`serum1`/`serum2`), so pairs can be built the same way for both.
+
+Each clinical draw has *two* real pepseq samples (one IgG, one IgA), and a handful of
+draws were sequenced on more than one run (e.g. subject 179's `16-Mar-18` IgG draw
+exists under both `IM0174` and `IM0163`) -- `isotype` and `run_id` both have to stay in
+the grouping key alongside `subject_id`/`record_id`, otherwise `pivot_wider` can't
+resolve a single `pepseq_sn` per cell.
+
+```{r}
+pairs_liwonde <- liwonde_tidy %>%
+  filter(!is.na(serum_which)) %>%
+  select(subject_id, record_id, isotype, run_id, serum_which, pepseq_sn) %>%
+  pivot_wider(names_from = serum_which, values_from = pepseq_sn) %>%
+  filter(!is.na(serum1), !is.na(serum2))
+
+pairs_mfera <- mfera_tidy %>%
+  filter(!is.na(serum_which)) %>%
+  select(subject_id, record_id, isotype, run_id, serum_which, pepseq_sn) %>%
+  pivot_wider(names_from = serum_which, values_from = pepseq_sn) %>%
+  filter(!is.na(serum1e), !is.na(serum2e))
+
+# Diagnostics matching msp1's style
+print(paste0("Liwonde subjects with complete serum1/serum2 pairs: ", nrow(pairs_liwonde)))
+print(paste0("Mfera subjects with complete serum1e/serum2e pairs: ", nrow(pairs_mfera)))
+
+# write_tsv(pairs_liwonde, file.path(output_dir, "pairs_liwonde.tsv"))
+# write_tsv(pairs_mfera, file.path(output_dir, "pairs_mfera.tsv"))
+# write_tsv(sample_tidy_all, file.path(output_dir, "sample_tidy_all.tsv"))
+# write_tsv(mfera_missing_pepseq, file.path(output_dir, "mfera_missing_pepseq.tsv"))
+# write_tsv(liwonde_missing_pepseq, file.path(output_dir, "liwonde_missing_pepseq.tsv"))
+# write_tsv(dup_mfera_codes, file.path(output_dir, "mfera_ambiguous_records.tsv"))
+# write_tsv(dup_liwonde_dates, file.path(output_dir, "liwonde_ambiguous_records.tsv"))
+```
