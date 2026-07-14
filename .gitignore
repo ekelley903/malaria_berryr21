@@ -5,3 +5,6 @@
 
 # Data kept local-only (exceeds GitHub's file size limits / not meant for version control)
 pepsirf_data/
+
+# Not meant for version control
+project_docs/
