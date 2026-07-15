@@ -5,6 +5,7 @@ format:
     code-fold: true
     code-summary: "Show code"
     code-tools: true
+    embed-resources: true
 date: 2026-07-14
 ---
 
@@ -301,7 +302,8 @@ print(paste0("Mfera subjects with complete serum1e/serum2e pairs: ", nrow(pairs_
 
 # write_tsv(pairs_liwonde, file.path(output_dir, "pairs_liwonde.tsv"))
 # write_tsv(pairs_mfera, file.path(output_dir, "pairs_mfera.tsv"))
-# write_tsv(sample_tidy_all, file.path(output_dir, "sample_tidy_all.tsv"))
+write_tsv(filter(sample_tidy_all, isotype == "IgG"), file.path(output_dir, "sample_subject_metadata_pepseq_IgG.tsv"))
+write_tsv(filter(sample_tidy_all, isotype == "IgA"), file.path(output_dir, "sample_subject_metadata_pepseq_IgA.tsv"))
 # write_tsv(mfera_missing_pepseq, file.path(output_dir, "mfera_missing_pepseq.tsv"))
 # write_tsv(liwonde_missing_pepseq, file.path(output_dir, "liwonde_missing_pepseq.tsv"))
 # write_tsv(dup_mfera_codes, file.path(output_dir, "mfera_ambiguous_records.tsv"))
