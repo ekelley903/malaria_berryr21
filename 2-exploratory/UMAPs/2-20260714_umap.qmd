@@ -1,0 +1,314 @@
+---
+title: "UMAP: plate structure in filtered Z-score data"
+format:
+  html:
+    code-fold: true
+    code-summary: "Show code"
+    code-tools: true
+    embed-resources: true
+date: 2026-07-14
+---
+
+```{r setup, message=FALSE}
+library(tidyverse)
+library(umap)
+library(viridis)
+library(patchwork)
+library(sva)
+
+set.seed(42)
+
+output_dir <- "out/20260714"
+
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+```
+
+## Load Z-score matrices + plate metadata, per isotype
+
+Sample columns in the raw Z-score TSVs include Sblk/control columns that never got
+a clinical/plate metadata row in `0-sample_tidy`. Inner-joining against
+`sample_subject_metadata_pepseq_*.tsv` on `pepseq_sn` both drops those controls and
+attaches `plate_id` for coloring, reusing the isotype/control filtering already done
+there instead of re-deriving it here.
+
+```{r load-join}
+load_isotype <- function(data_path, metadata_path) {
+  data_wide <- read_tsv(data_path, show_col_types = FALSE) %>%
+    rename(library_member = `Sequence name`)
+
+  metadata <- read_tsv(metadata_path, show_col_types = FALSE) %>%
+    select(pepseq_sn, plate_id, subject_id, cohort)
+
+  keep_samples <- intersect(colnames(data_wide), metadata$pepseq_sn)
+
+  list(
+    values = data_wide %>% select(library_member, all_of(keep_samples)),
+    metadata = metadata %>% filter(pepseq_sn %in% keep_samples)
+  )
+}
+
+igg <- load_isotype(
+  "../../pepsirf_data/data_for_sharing_20250214/IM0166_IM0174_PF1_raw_4mm_IgG_qc_Z-HDI85.tsv",
+  "../../0-sample_tidy/out/20260714/sample_subject_metadata_pepseq_IgG.tsv"
+)
+
+iga <- load_isotype(
+  "../../pepsirf_data/data_for_sharing_20250214/IM0166_PF1_raw_4mm_IgA_qc_Z-HDI85.tsv",
+  "../../0-sample_tidy/out/20260714/sample_subject_metadata_pepseq_IgA.tsv"
+)
+
+print(paste0("IgG: ", ncol(igg$values) - 1, " samples retained after control-dropping join"))
+print(paste0("IgA: ", ncol(iga$values) - 1, " samples retained after control-dropping join"))
+```
+
+## Peptide filter: at least 3 samples with Z > 6
+
+```{r peptide-filter}
+filter_peptides <- function(data_wide) {
+  mat <- data_wide %>% select(-library_member) %>% as.matrix()
+  keep <- rowSums(mat > 6) >= 3
+  data_wide[keep, ]
+}
+
+igg$values_filtered <- filter_peptides(igg$values)
+iga$values_filtered <- filter_peptides(iga$values)
+
+print(paste0("IgG: ", nrow(igg$values_filtered), " of ", nrow(igg$values),
+             " peptides retained (>=3 samples with Z > 6)"))
+print(paste0("IgA: ", nrow(iga$values_filtered), " of ", nrow(iga$values),
+             " peptides retained (>=3 samples with Z > 6)"))
+```
+
+## UMAP + plotting helpers
+
+```{r umap-helpers}
+run_umap <- function(zscore_wide, metadata) {
+  mat <- zscore_wide %>%
+    select(-library_member) %>%
+    as.matrix() %>%
+    t()
+
+  set.seed(42)
+  fit <- umap(mat)
+
+  as_tibble(fit$layout, .name_repair = ~ c("UMAP1", "UMAP2")) %>%
+    mutate(pepseq_sn = rownames(mat)) %>%
+    left_join(metadata, by = "pepseq_sn")
+}
+
+plot_umap <- function(umap_coords, title) {
+  ggplot(umap_coords, aes(UMAP1, UMAP2, color = plate_id)) +
+    geom_point(size = 2, alpha = 0.8) +
+    scale_color_viridis_d(name = "Plate") +
+    theme_minimal() +
+    theme(legend.position = "bottom") +
+    labs(title = title)
+}
+```
+
+## Base UMAPs (colored by plate)
+
+```{r base-umap}
+#| fig-width: 12
+#| fig-height: 6
+umap_igg_all <- run_umap(igg$values_filtered, igg$metadata)
+umap_iga_all <- run_umap(iga$values_filtered, iga$metadata)
+
+p_igg_all <- plot_umap(umap_igg_all, "IgG (all filtered peptides)")
+p_iga_all <- plot_umap(umap_iga_all, "IgA (all filtered peptides)")
+
+p_igg_all + p_iga_all
+```
+
+## Library-filtered UMAPs (PV2 vs PF3D7)
+
+`class == "PV2"` (P. vivax) vs `class == "PF3D7"` (P. falciparum) further restrict
+the already `>=3`-samples-Z>6-filtered peptide set from above -- not an independent
+filter.
+
+```{r library-filter}
+pf1_annot <- read_csv("../../utils/PF1_annot.csv", show_col_types = FALSE)
+
+pv2_peptides <- pf1_annot %>% filter(class == "PV2") %>% pull(library_member)
+pf3d7_peptides <- pf1_annot %>% filter(class == "PF3D7") %>% pull(library_member)
+
+igg_pv2 <- igg$values_filtered %>% filter(library_member %in% pv2_peptides)
+igg_pf3d7 <- igg$values_filtered %>% filter(library_member %in% pf3d7_peptides)
+iga_pv2 <- iga$values_filtered %>% filter(library_member %in% pv2_peptides)
+iga_pf3d7 <- iga$values_filtered %>% filter(library_member %in% pf3d7_peptides)
+
+print(paste0("IgG PV2: ", nrow(igg_pv2), " peptides, PF3D7: ", nrow(igg_pf3d7), " peptides"))
+print(paste0("IgA PV2: ", nrow(iga_pv2), " peptides, PF3D7: ", nrow(iga_pf3d7), " peptides"))
+```
+
+```{r library-umap}
+#| fig-width: 12
+#| fig-height: 12
+umap_igg_pv2 <- run_umap(igg_pv2, igg$metadata)
+umap_igg_pf3d7 <- run_umap(igg_pf3d7, igg$metadata)
+umap_iga_pv2 <- run_umap(iga_pv2, iga$metadata)
+umap_iga_pf3d7 <- run_umap(iga_pf3d7, iga$metadata)
+
+p_igg_pv2 <- plot_umap(umap_igg_pv2, "IgG (PV2 only)")
+p_igg_pf3d7 <- plot_umap(umap_igg_pf3d7, "IgG (PF3D7 only)")
+p_iga_pv2 <- plot_umap(umap_iga_pv2, "IgA (PV2 only)")
+p_iga_pf3d7 <- plot_umap(umap_iga_pf3d7, "IgA (PF3D7 only)")
+
+# max 2 panels per row
+wrap_plots(p_igg_all, p_igg_pv2, p_igg_pf3d7, ncol = 2)
+wrap_plots(p_iga_all, p_iga_pv2, p_iga_pf3d7, ncol = 2)
+```
+
+## Companion norm-count UMAPs
+
+Same peptide set as the base UMAPs above (`>=3` samples with Z > 6), but run on the
+companion normalized read counts (`*_qc_norm_counts.tsv`) instead of Z-scores --
+peptide filtering stays anchored to the Z-score criteria; only the values fed into
+UMAP change. Peptide ID sets are identical between each isotype's Z-score and
+norm-count files, so no `library_member`s are lost re-selecting into the norm-count
+matrix.
+
+```{r norm-counts-load}
+igg_norm <- load_isotype(
+  "../../pepsirf_data/data_for_sharing_20250214/IM0166_IM0174_PF1_raw_4mm_IgG_qc_norm_counts.tsv",
+  "../../0-sample_tidy/out/20260714/sample_subject_metadata_pepseq_IgG.tsv"
+)
+
+iga_norm <- load_isotype(
+  "../../pepsirf_data/data_for_sharing_20250214/IM0166_PF1_raw_4mm_IgA_qc_norm_counts.tsv",
+  "../../0-sample_tidy/out/20260714/sample_subject_metadata_pepseq_IgA.tsv"
+)
+
+igg_norm_filtered <- igg_norm$values %>% filter(library_member %in% igg$values_filtered$library_member)
+iga_norm_filtered <- iga_norm$values %>% filter(library_member %in% iga$values_filtered$library_member)
+
+print(paste0("IgG norm counts: ", nrow(igg_norm_filtered), " of ", nrow(igg$values_filtered),
+             " Z-filtered peptides found in the norm-count matrix"))
+print(paste0("IgA norm counts: ", nrow(iga_norm_filtered), " of ", nrow(iga$values_filtered),
+             " Z-filtered peptides found in the norm-count matrix"))
+```
+
+```{r norm-counts-umap}
+#| fig-width: 12
+#| fig-height: 6
+umap_igg_norm <- run_umap(igg_norm_filtered, igg_norm$metadata)
+umap_iga_norm <- run_umap(iga_norm_filtered, iga_norm$metadata)
+
+p_igg_norm <- plot_umap(umap_igg_norm, "IgG (norm counts, Z-filtered peptides)")
+p_iga_norm <- plot_umap(umap_iga_norm, "IgA (norm counts, Z-filtered peptides)")
+
+p_igg_norm + p_iga_norm
+```
+
+## ComBat-seq corrected UMAPs
+
+CLAUDE.md documents that Alexis's original `ComBat()` run -- on raw, untransformed
+counts, no `mod`/`group` argument -- made the plate batch effect *worse* by every
+diagnostic (0% OOB error, plate fully separable post-correction), and names two
+untested next steps: run `ComBat_seq` (negative-binomial-based, built for raw counts)
+directly on raw counts instead, and protect a biological covariate via `group`/`mod`
+so it isn't removed alongside the batch effect. This section does both, restricted to
+the same Z-filtered peptide set used everywhere else in this doc, so the resulting
+UMAPs are directly comparable to the uncorrected base panels above.
+
+`batch = plate_id` (the run-qualified `IM0163_Plate 3`-style values from the corrected
+plate join) is the effect under test; `group = cohort` protects Mfera vs Liwonde
+differences (zero NAs, reasonably balanced across plates in both isotypes).
+
+```{r combat-load}
+igg_raw <- load_isotype(
+  "../../pepsirf_data/data_for_sharing_20250214/IM0166_IM0174_PF1_raw_4mm_IgG_qc_raw_counts.tsv",
+  "../../0-sample_tidy/out/20260714/sample_subject_metadata_pepseq_IgG.tsv"
+)
+
+iga_raw <- load_isotype(
+  "../../pepsirf_data/data_for_sharing_20250214/IM0166_PF1_raw_4mm_IgA_qc_raw_counts.tsv",
+  "../../0-sample_tidy/out/20260714/sample_subject_metadata_pepseq_IgA.tsv"
+)
+
+igg_raw_filtered <- igg_raw$values %>% filter(library_member %in% igg$values_filtered$library_member)
+iga_raw_filtered <- iga_raw$values %>% filter(library_member %in% iga$values_filtered$library_member)
+
+print(paste0("IgG raw counts: ", nrow(igg_raw_filtered), " of ", nrow(igg$values_filtered),
+             " Z-filtered peptides found in the raw-count matrix"))
+print(paste0("IgA raw counts: ", nrow(iga_raw_filtered), " of ", nrow(iga$values_filtered),
+             " Z-filtered peptides found in the raw-count matrix"))
+```
+
+```{r combat-run}
+run_combat_seq <- function(data_wide, metadata) {
+  mat <- data_wide %>% select(-library_member) %>% as.matrix()
+  rownames(mat) <- data_wide$library_member
+
+  # ComBat_seq's batch/group vectors must align positionally with mat's columns,
+  # not just match by set membership -- reorder metadata to match.
+  meta_ordered <- metadata %>%
+    filter(pepseq_sn %in% colnames(mat)) %>%
+    arrange(match(pepseq_sn, colnames(mat)))
+
+  adjusted <- ComBat_seq(
+    counts = mat,
+    batch = meta_ordered$plate_id,
+    group = meta_ordered$cohort
+  )
+
+  as_tibble(adjusted, rownames = "library_member")
+}
+
+igg_combat <- run_combat_seq(igg_raw_filtered, igg$metadata)
+iga_combat <- run_combat_seq(iga_raw_filtered, iga$metadata)
+```
+
+```{r combat-umap}
+#| fig-width: 12
+#| fig-height: 12
+igg_combat_pv2 <- igg_combat %>% filter(library_member %in% pv2_peptides)
+igg_combat_pf3d7 <- igg_combat %>% filter(library_member %in% pf3d7_peptides)
+iga_combat_pv2 <- iga_combat %>% filter(library_member %in% pv2_peptides)
+iga_combat_pf3d7 <- iga_combat %>% filter(library_member %in% pf3d7_peptides)
+
+umap_igg_combat <- run_umap(igg_combat, igg$metadata)
+umap_iga_combat <- run_umap(iga_combat, iga$metadata)
+umap_igg_combat_pv2 <- run_umap(igg_combat_pv2, igg$metadata)
+umap_igg_combat_pf3d7 <- run_umap(igg_combat_pf3d7, igg$metadata)
+umap_iga_combat_pv2 <- run_umap(iga_combat_pv2, iga$metadata)
+umap_iga_combat_pf3d7 <- run_umap(iga_combat_pf3d7, iga$metadata)
+
+p_igg_combat <- plot_umap(umap_igg_combat, "IgG (ComBat-seq corrected, all filtered peptides)")
+p_iga_combat <- plot_umap(umap_iga_combat, "IgA (ComBat-seq corrected, all filtered peptides)")
+p_igg_combat_pv2 <- plot_umap(umap_igg_combat_pv2, "IgG (ComBat-seq corrected, PV2 only)")
+p_igg_combat_pf3d7 <- plot_umap(umap_igg_combat_pf3d7, "IgG (ComBat-seq corrected, PF3D7 only)")
+p_iga_combat_pv2 <- plot_umap(umap_iga_combat_pv2, "IgA (ComBat-seq corrected, PV2 only)")
+p_iga_combat_pf3d7 <- plot_umap(umap_iga_combat_pf3d7, "IgA (ComBat-seq corrected, PF3D7 only)")
+
+# max 2 panels per row
+wrap_plots(p_igg_combat, p_igg_combat_pv2, p_igg_combat_pf3d7, ncol = 2)
+wrap_plots(p_iga_combat, p_iga_combat_pv2, p_iga_combat_pf3d7, ncol = 2)
+```
+
+## Outputs
+
+```{r outputs}
+# write_tsv(umap_igg_all, file.path(output_dir, "umap_coords_igg_all.tsv"))
+# write_tsv(umap_igg_pv2, file.path(output_dir, "umap_coords_igg_pv2.tsv"))
+# write_tsv(umap_igg_pf3d7, file.path(output_dir, "umap_coords_igg_pf3d7.tsv"))
+# write_tsv(umap_iga_all, file.path(output_dir, "umap_coords_iga_all.tsv"))
+# write_tsv(umap_iga_pv2, file.path(output_dir, "umap_coords_iga_pv2.tsv"))
+# write_tsv(umap_iga_pf3d7, file.path(output_dir, "umap_coords_iga_pf3d7.tsv"))
+# write_tsv(umap_igg_norm, file.path(output_dir, "umap_coords_igg_norm.tsv"))
+# write_tsv(umap_iga_norm, file.path(output_dir, "umap_coords_iga_norm.tsv"))
+# write_tsv(umap_igg_combat, file.path(output_dir, "umap_coords_igg_combat.tsv"))
+# write_tsv(umap_igg_combat_pv2, file.path(output_dir, "umap_coords_igg_combat_pv2.tsv"))
+# write_tsv(umap_igg_combat_pf3d7, file.path(output_dir, "umap_coords_igg_combat_pf3d7.tsv"))
+# write_tsv(umap_iga_combat, file.path(output_dir, "umap_coords_iga_combat.tsv"))
+# write_tsv(umap_iga_combat_pv2, file.path(output_dir, "umap_coords_iga_combat_pv2.tsv"))
+# write_tsv(umap_iga_combat_pf3d7, file.path(output_dir, "umap_coords_iga_combat_pf3d7.tsv"))
+
+# ggsave(file.path(output_dir, "umap_igg_panel.png"), wrap_plots(p_igg_all, p_igg_pv2, p_igg_pf3d7, ncol = 2), width = 12, height = 12)
+# ggsave(file.path(output_dir, "umap_iga_panel.png"), wrap_plots(p_iga_all, p_iga_pv2, p_iga_pf3d7, ncol = 2), width = 12, height = 12)
+# ggsave(file.path(output_dir, "umap_norm_panel.png"), p_igg_norm + p_iga_norm, width = 12, height = 6)
+# ggsave(file.path(output_dir, "umap_igg_combat_panel.png"), wrap_plots(p_igg_combat, p_igg_combat_pv2, p_igg_combat_pf3d7, ncol = 2), width = 12, height = 12)
+# ggsave(file.path(output_dir, "umap_iga_combat_panel.png"), wrap_plots(p_iga_combat, p_iga_combat_pv2, p_iga_combat_pf3d7, ncol = 2), width = 12, height = 12)
+```
