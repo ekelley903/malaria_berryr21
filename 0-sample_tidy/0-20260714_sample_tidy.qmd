@@ -217,54 +217,48 @@ persisting even in Z-scores -- that correction, e.g. via ComBat, is a downstream
 analysis decision, out of scope here).
 
 That file's IM0163 coverage turned out to be a partial export (only ~half of Mfera
-subjects). `IM0163_plate_info.xlsx` is the full wet-lab tracking workbook for that run;
-its `NEW ZZSHEET-PF1` tab gives complete IM0163 coverage but in a 4-plates-side-by-side
-print layout rather than a flat list -- 4 repeated column blocks of
-`Index1 | Index2 | SampleName | [blank] | plate | well`, starting at columns 1, 8, 15,
-22. Reassemble by reading blocks separately and stacking them.
+subjects). An earlier version of this script filled the gap by hand-parsing
+`IM0163_plate_info.xlsx`'s `NEW ZZSHEET-PF1` tab (a 4-plates-side-by-side print layout,
+4 repeated column blocks of `Index1 | Index2 | SampleName | [blank] | F1 | R1`) -- but
+that parsing had a bug: it renamed `F1` (the well's *column number*, 1-12) to `plate_id`
+and `R1` (the well's *row letter*, A-H) to `well`, so it was reporting well-column
+numbers as plate identities. That's why an earlier render showed 12 "plates" for IgG and
+8 for IgA -- there are really only 4 physical IM0163 plates.
 
-Not fully resolved: this tab's plate numbers (1-12, spanning both isotypes per plate)
-don't obviously correspond to the workbook's separate "Plate 1"-"Plate 7" tab names
-elsewhere in the same file -- worth a sanity check with whoever maintains this workbook
-before treating the numbering as more than "which physical batch".
+**Fix**: `PF1_plate_well_sequencingrun_updated.xlsx` is a corrected export that
+supersedes both the old file's IM0163 rows and the `IM0163_plate_info.xlsx`
+block-parsing workaround entirely -- for the 116 `SampleName`s it shares with the old
+file, `plate_id`/`well` agree 100%, and it adds the previously-missing other half of
+IM0163 (238 rows total, 4 real distinct plates). It has no IM0174 rows, so the old file
+is still needed, but now only for its 13 IM0174-only samples (all IgG).
+
+One more wrinkle: the old file's IM0174 rows independently use labels like `Plate 3`
+that collide with the *updated* file's IM0163 `Plate 3` -- different physical plates
+from different sequencing runs that happen to share a number. `plate_id` is prefixed
+with the run ID below (e.g. `IM0163_Plate 3` vs `IM0174_Plate 3`) so nothing downstream
+that groups/colors by `plate_id` alone can silently conflate them the way the
+well-column bug did.
 
 ```{r}
-plate_map_im0174 <- read_excel("../sample_data/Shared sample information/PF1_plate_well_sequencingrun.xlsx") %>%
-  rename(pepseq_sn = SampleName) %>%
-  select(pepseq_sn, plate_id, well) %>%
-  mutate(plate_id = as.character(plate_id))
-
-zzsheet_pf1_raw <- suppressMessages(read_excel(
-  "../sample_data/Shared sample information/IM0163_plate_info.xlsx",
-  sheet = "NEW ZZSHEET-PF1", col_names = FALSE, skip = 2
-))
-
-extract_plate_block <- function(df, start_col) {
-  df %>%
-    select(all_of(start_col:(start_col + 5))) %>%
-    set_names(c("Index1", "Index2", "pepseq_sn", "blank_sep", "plate_id", "well")) %>%
-    select(-blank_sep) %>%
-    filter(!is.na(pepseq_sn))
-}
-
-plate_map_im0163 <- bind_rows(
-  extract_plate_block(zzsheet_pf1_raw, 1),
-  extract_plate_block(zzsheet_pf1_raw, 8),
-  extract_plate_block(zzsheet_pf1_raw, 15),
-  extract_plate_block(zzsheet_pf1_raw, 22)
+plate_map <- bind_rows(
+  read_excel("../sample_data/Shared sample information/PF1_plate_well_sequencingrun_updated.xlsx"),
+  read_excel("../sample_data/Shared sample information/PF1_plate_well_sequencingrun.xlsx")
 ) %>%
-  select(pepseq_sn, plate_id, well) %>%
-  # normalize "1.0" -> "Plate 1" to match PF1_plate_well_sequencingrun.xlsx's format
-  mutate(plate_id = paste0("Plate ", as.integer(as.numeric(plate_id))))
-
-plate_map <- bind_rows(plate_map_im0163, plate_map_im0174) %>%
-  distinct(pepseq_sn, .keep_all = TRUE)
+  rename(pepseq_sn = SampleName) %>%
+  distinct(pepseq_sn, .keep_all = TRUE) %>%
+  mutate(
+    run_extracted = str_extract(pepseq_sn, "IM\\d{4}"),
+    plate_id = paste0(run_extracted, "_Plate ", as.integer(str_extract(as.character(plate_id), "\\d+")))
+  ) %>%
+  select(pepseq_sn, plate_id, well)
 
 sample_tidy_all <- bind_rows(mfera_tidy, liwonde_tidy) %>%
   left_join(plate_map, by = "pepseq_sn")
 
 print(paste0(sum(!is.na(sample_tidy_all$plate_id)), " of ", nrow(sample_tidy_all),
              " samples matched to a plate assignment"))
+print(paste0(n_distinct(sample_tidy_all$plate_id[sample_tidy_all$isotype == "IgG"]), " distinct IgG plates, ",
+             n_distinct(sample_tidy_all$plate_id[sample_tidy_all$isotype == "IgA"]), " distinct IgA plates"))
 ```
 
 ## Pairs
